@@ -1,0 +1,36 @@
+# =====================================================================
+# requirements.txt — Predictive Maintenance (RUL) project
+# NASA C-MAPSS turbofan engine health classification
+#
+# Install:  pip install -r requirements.txt
+# =====================================================================
+
+# --- Core scientific stack ---
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+
+# --- Visualisation ---
+matplotlib==3.9.0
+seaborn==0.13.2
+
+# --- Machine learning ---
+scikit-learn==1.5.0
+xgboost==2.1.0
+joblib==1.4.2
+
+# --- Deep learning (optional — LSTM model) ---
+# Install separately if GPU support is needed:
+#   pip install tensorflow[and-cuda]==2.17.0
+tensorflow==2.17.0
+
+# --- Explainability ---
+shap==0.44.1
+
+# --- Inference API ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.1
+
+# --- Dataset download ---
+kagglehub==0.2.9

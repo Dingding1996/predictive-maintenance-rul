@@ -26,9 +26,17 @@ maintenance teams to intervene before catastrophic failure.
 **NASA C-MAPSS** (Commercial Modular Aero-Propulsion System Simulation)
 Source: [Kaggle — behrad3d/nasa-cmaps](https://www.kaggle.com/datasets/behrad3d/nasa-cmaps)
 
-- 4 sub-datasets (FD001–FD004): varying operating conditions and fault modes
-- 21 sensor channels + 3 operational settings per cycle
-- Full run-to-failure trajectories for each engine unit
+| Sub-dataset | Operating conditions | Fault modes | Train engines | Test engines |
+|---|---|---|---|---|
+| FD001 | 1 | HPC degradation | 100 | 100 |
+| FD002 | 6 | HPC degradation | 260 | 259 |
+| FD003 | 1 | HPC + fan degradation | 100 | 100 |
+| FD004 | 6 | HPC + fan degradation | 249 | 248 |
+
+The dataset ships with a **predefined engine-level train/test split**:
+- `train_FD00X.txt` — complete run-to-failure trajectories; labels derived internally
+- `test_FD00X.txt` — truncated sequences of entirely unseen engines
+- `RUL_FD00X.txt` — ground-truth RUL at the last observed test cycle (used to reconstruct `y_test`)
 
 Dataset is downloaded automatically via `kagglehub` on first run.
 
@@ -69,12 +77,12 @@ Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explain
 
 | Section | What happens |
 |---|---|
-| 1. Data Acquisition | Download C-MAPSS via kagglehub; load FD001–FD004 |
-| 2. EDA | Class distribution, sensor trends, correlation heatmap |
-| 3. Preprocessing | RUL labelling, 30-cycle rolling features, min-max normalisation |
-| 4. Model Definition | FLAML AutoML configuration; LSTM sequence model |
+| 1. Data Acquisition | Download C-MAPSS via kagglehub; load train + test splits for FD001–FD004 |
+| 2. EDA | Class distribution, sensor degradation trends, correlation heatmap |
+| 3. Preprocessing | RUL labelling → data-driven threshold search → operating-condition normalisation → 30-cycle rolling features → 100-cycle long-window features (lw_mean, lw_std, slope) → min-max scaling |
+| 4. Model Definition | FLAML AutoML configuration; optional LSTM sequence model |
 | 5. AutoML & Model Selection | FLAML searches LightGBM / XGBoost / RF / linear models; best run logged to MLflow |
-| 6. Evaluation | Test-set metrics (accuracy, F1-macro, F1-weighted) |
+| 6. Evaluation | Test-set metrics (accuracy, F1-macro, F1-weighted) on unseen engines |
 | 7. Visualisations | Confusion matrices, feature importance, LSTM training curves |
 | 8. Explainability | SHAP TreeExplainer — beeswarm + global bar chart |
 | 9. Summary | Key findings and limitations |
@@ -87,36 +95,48 @@ Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explain
 - Searches over LightGBM, XGBoost, Random Forest, Extra Trees, and linear models
 - Optimises F1-weighted using a cost-frugal Bayesian search strategy
 - Best model and hyperparameters registered automatically in MLflow Model Registry
-- Input: flat rolling-feature vector (73 features per cycle window)
+- Input: flat feature vector (115 features per cycle: 14 sensors × 8 statistics + 3 op_settings)
 
 ### LSTM (optional — requires TensorFlow)
-- Input: sensor sequences `(30 cycles × 14 sensors)`
+- Input: sequences of engineered features `(30 cycles × 115 features)` — same feature set as AutoML
 - 2-layer LSTM (128 → 64 units) with dropout, early stopping, and class-weighted training
-- Captures temporal degradation patterns end-to-end
+- Captures temporal degradation patterns across consecutive cycles end-to-end
 
 ---
 
 ## Key Results
 
+> Results below are from the current clean pipeline: official engine-level train/test split,
+> operating-condition normalisation, and leakage-free scaling. Re-run the notebook to reproduce.
+
 | Model | CV F1-weighted | Test F1-weighted | Test F1-macro | Test Accuracy |
 |---|---|---|---|---|
-| **FLAML AutoML (LightGBM)** | — | **0.9877** | **0.9821** | **0.9877** |
-| XGBoost (baseline) | 0.9542 ± 0.0016 | 0.9571 | 0.9442 | 0.9577 |
-| LSTM | — | 0.8784 | 0.8620 | 0.8795 |
+| **FLAML AutoML (LightGBM)** | — | — | — | — |
+| LSTM | — | — | — | — |
 
-FLAML selected LightGBM as the best estimator, outperforming the manual XGBoost
-baseline by +3.1 pp F1-weighted with no hand-tuning required.
+*Numbers to be updated after notebook re-run with the corrected pipeline.*
+
+**Previous results (row-level split, no condition normalisation — inflated by leakage):**
+
+| Model | Test F1-weighted | Test Accuracy |
+|---|---|---|
+| FLAML AutoML (LightGBM) | 0.9877 | 0.9877 |
+
+Those numbers should not be compared against the current pipeline — the evaluation setup was fundamentally different (test cycles from the same engines seen in training).
 
 ---
 
 ## Explainability
 
-SHAP values identify the most predictive features for the **Critical** class:
+SHAP values identify the most predictive features for the **Critical** class
+(update after re-run — list below reflects previous pipeline):
 
 - `sensor_14_mean` / `sensor_14_std` — core speed tracks late-stage degradation
 - `sensor_11_mean` — HPC static pressure rises with compressor fouling
-- `norm_cycle` — temporal progress is independently predictive
 - `sensor_04_delta` — rate-of-change in LPT outlet temperature
+
+Note: `norm_cycle` is **excluded** from features — it encodes lifecycle position derived
+from the failure point and constitutes target leakage.
 
 ![SHAP global importance](assets/shap_global_importance.png)
 
@@ -134,7 +154,7 @@ python -m mlflow ui
 ```
 
 Each run records:
-- All Section 0 constants (window size, RUL thresholds, test split, etc.)
+- All Section 0 constants (window size, RUL thresholds, number of op-condition clusters, etc.)
 - FLAML search configuration (time budget, metric)
 - Best estimator name and hyperparameters
 - CV F1-weighted, test accuracy, test F1-macro, test F1-weighted
@@ -163,25 +183,13 @@ docker compose up --build
 | Method | Endpoint | Input | Description |
 |---|---|---|---|
 | GET | `/health` | — | Liveness probe + model metadata |
-| POST | `/predict` | Pre-extracted feature vectors | Batch tabular inference |
-| POST | `/predict_raw` | Raw cycle sensor readings | Full pipeline server-side |
+| POST | `/predict_file` | C-MAPSS `.txt` file upload | Full pipeline server-side: condition normalisation → rolling features → min-max → predict |
 
-**`/predict_raw` example** — send raw sensor readings, get health label back:
+**`/predict_file` example** — upload a raw C-MAPSS test file, get health label back:
 
 ```bash
-curl -X POST http://localhost:8001/predict_raw \
-  -H "Content-Type: application/json" \
-  -d '{
-    "unit_id": 1,
-    "cycles": [{
-      "op_setting_1": 0.0, "op_setting_2": 0.0, "op_setting_3": 100.0,
-      "sensor_02": 641.8, "sensor_03": 1589.7, "sensor_04": 1400.6,
-      "sensor_07": 554.4, "sensor_08": 2388.0, "sensor_09": 9046.2,
-      "sensor_11": 47.5,  "sensor_12": 521.7,  "sensor_13": 2388.1,
-      "sensor_14": 8138.6,"sensor_15": 8.4195, "sensor_17": 392.0,
-      "sensor_20": 38.8,  "sensor_21": 23.4
-    }]
-  }'
+curl -X POST "http://localhost:8001/predict_file?unit_id=1" \
+  -F "file=@data/raw/test_FD001.txt"
 # → {"labels": ["Healthy"], "predictions": [0], "probabilities": [[0.91, 0.07, 0.02]], ...}
 ```
 
@@ -231,10 +239,10 @@ jupyter lab PredictiveMaintenance_Training.ipynb
 
 ## Limitations & Next Steps
 
-- Health-class thresholds (RUL 80/30) are heuristic; cost-sensitive optimisation
-  could align them with actual maintenance economics
-- FD002/FD004 (6 operating conditions) are harder sub-tasks; clustering operating
-  regimes before classification may improve performance
-- Transformer-based sequence models (e.g. TST) may outperform LSTM with less tuning
+- Health-class thresholds are searched data-driven (ExtraTrees proxy grid search) but remain a proxy for true maintenance economics; a cost-sensitive objective could further improve Critical recall
+- Transformer-based sequence models (e.g. Temporal Fusion Transformer) may outperform
+  LSTM with less hyperparameter tuning
+- The k-means operating-condition clustering uses k=6 (matching FD002/FD004's known
+  regimes); a data-driven k selection (elbow / silhouette) would be more principled
 - A shared MLflow tracking server would unify experiment history across multiple
   portfolio projects

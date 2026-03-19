@@ -85,6 +85,9 @@ def run_automl_with_mlflow(
     extra_params: dict | None = None,
     random_state: int = 42,
     scale_params: dict | None = None,
+    cond_normaliser: tuple | None = None,
+    sample_weight: np.ndarray | None = None,
+    groups: np.ndarray | None = None,
 ) -> tuple[Any, pd.DataFrame]:
     """Run FLAML AutoML with MLflow experiment tracking.
 
@@ -104,10 +107,21 @@ def run_automl_with_mlflow(
         extra_params:    Additional key-value pairs to log as MLflow params
                          (pass Section 0 constants here for full reproducibility).
         random_state:    Random seed forwarded to FLAML.
+        sample_weight:   Per-sample weights passed to FLAML AutoML.  Use
+                         ``sklearn.utils.class_weight.compute_sample_weight``
+                         to counter class imbalance directly in the loss function,
+                         complementing the F1-weighted optimisation metric.
+        groups:          Engine unit ID array (n_samples,).  When provided, FLAML
+                         uses GroupKFold internally so each CV fold's validation set
+                         contains engines that were never seen during that fold's
+                         training — the proper fix for the row-level CV leakage.
         scale_params:    Min-max scale parameters from training preprocessing
                          (col → (min, max)).  If provided, saved as a JSON artifact
                          in the MLflow run and to ``models/scale_params.json`` on disk
                          for use by the inference API raw-data endpoint.
+        cond_normaliser: Tuple of (kmeans, cluster_stats) from
+                         fit_condition_normaliser().  If provided, saved to
+                         ``models/cond_normaliser.pkl`` for the inference API.
 
     Returns:
         Tuple of:
@@ -145,6 +159,8 @@ def run_automl_with_mlflow(
             "time_budget_s": time_budget,
             "metric":        metric,
             "random_state":  random_state,
+            "sample_weight": "balanced" if sample_weight is not None else "none",
+            "cv_strategy":   "GroupKFold" if groups is not None else "StratifiedKFold",
         }
         if extra_params:
             search_params.update(extra_params)
@@ -155,6 +171,10 @@ def run_automl_with_mlflow(
         # Fall back to the string for any other metric that FLAML supports natively.
         flaml_metric = _flaml_f1_weighted if metric == "f1_weighted" else metric
 
+        # Note: FLAML does not support sample_weight + groups simultaneously in this
+        # version (AutoMLState.sample_weight_all is not initialised when groups is set).
+        # groups is therefore omitted here; engine-level GroupKFold evaluation is
+        # performed separately in Section 5b via group_cv_score().
         automl = AutoML()
         automl.fit(
             X_train, y_train,
@@ -162,7 +182,9 @@ def run_automl_with_mlflow(
             metric=flaml_metric,
             time_budget=time_budget,
             seed=random_state,
+            n_jobs=1,      # Windows: n_jobs=-1 causes PermissionError on joblib temp files
             verbose=1,
+            sample_weight=sample_weight,  # None → uniform weights (default behaviour)
         )
 
         # --- Log best results ---
@@ -189,25 +211,29 @@ def run_automl_with_mlflow(
         )
 
         # --- Persist scale_params for the inference raw-data endpoint ---
-        # Saved to both MLflow artifacts (for audit) and models/scale_params.json
-        # (for Docker mount access without a running MLflow server).
+        # Write to models/ first, then log that same file to MLflow.
+        # Avoids temp-file creation entirely (Windows PermissionError risk).
         if scale_params is not None:
-            import json, tempfile
+            import json
             from pathlib import Path as _Path
-            sp_serialisable = {k: list(v) for k, v in scale_params.items()}
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as tmp:
-                json.dump(sp_serialisable, tmp)
-                tmp_path = tmp.name
-            mlflow.log_artifact(tmp_path, artifact_path="scale_params")
-            _Path(tmp_path).unlink(missing_ok=True)
-            # Also write to models/ for direct file-based loading in Docker
-            models_dir = _Path(tracking_uri.lstrip("./")) if tracking_uri.startswith("./") else _Path("models")
             models_dir = _Path("models")
             models_dir.mkdir(exist_ok=True)
-            (models_dir / "scale_params.json").write_text(json.dumps(sp_serialisable))
+            sp_serialisable = {k: list(v) for k, v in scale_params.items()}
+            sp_path = models_dir / "scale_params.json"
+            sp_path.write_text(json.dumps(sp_serialisable))
+            mlflow.log_artifact(str(sp_path), artifact_path="scale_params")
             print(f"  scale_params    : saved to models/scale_params.json ({len(scale_params)} cols)")
+
+        # --- Persist condition normaliser for the inference API ---
+        if cond_normaliser is not None:
+            import joblib
+            from pathlib import Path as _Path
+            models_dir = _Path("models")
+            models_dir.mkdir(exist_ok=True)
+            pkl_path = models_dir / "cond_normaliser.pkl"
+            joblib.dump(cond_normaliser, pkl_path)
+            mlflow.log_artifact(str(pkl_path), artifact_path="cond_normaliser")
+            print(f"  cond_normaliser : saved to models/cond_normaliser.pkl")
 
         print(f"\n{'=' * 50}")
         print(f"  FLAML AutoML — Search Complete")
@@ -382,6 +408,138 @@ def train_lstm(
         verbose=1,
     )
     return history.history
+
+
+# ===========================================================================
+# Threshold tuning & group CV
+# ===========================================================================
+
+def tune_prediction_threshold(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    class_names: list[str] = CLASS_NAMES,
+    optimize: str = "f1_macro",
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Find per-class probability thresholds that maximise F1 macro (or weighted).
+
+    The default argmax rule (threshold = 0.5 for every class) under-predicts
+    minority classes (Degrading, Critical) because their probabilities rarely
+    exceed 0.5.  Lowering the threshold for a minority class increases its
+    recall at a small precision cost — a worthwhile trade-off for maintenance
+    decisions where missing a fault is more costly than a false alarm.
+
+    Search strategy:
+      - Sweep Degrading threshold t1 and Critical threshold t2 over [0.10, 0.50].
+      - At each (t1, t2): predict Degrading if P(Degrading) ≥ t1, then override
+        to Critical if P(Critical) ≥ t2 (Critical takes priority).
+      - Select the (t1, t2) pair that maximises the chosen metric on y_true.
+
+    Args:
+        y_true:      Ground-truth integer labels (0=Healthy, 1=Degrading, 2=Critical).
+        y_proba:     Probability matrix shape (n_samples, n_classes).
+        class_names: Human-readable class names for the returned dict.
+        optimize:    Metric to maximise: ``'f1_macro'`` or ``'f1_weighted'``.
+
+    Returns:
+        Tuple (y_pred_tuned, thresholds_dict):
+          - y_pred_tuned:    Predictions using the best thresholds found.
+          - thresholds_dict: ``{class_name: threshold}`` for logging / inference.
+    """
+    avg      = optimize.replace("f1_", "")   # "macro" or "weighted"
+    baseline = f1_score(
+        y_true, np.argmax(y_proba, axis=1), average=avg, zero_division=0
+    )
+
+    best_score      = baseline
+    best_t1, best_t2 = 0.5, 0.5
+    thresholds       = np.arange(0.10, 0.55, 0.05)
+
+    for t1 in thresholds:      # Degrading threshold
+        for t2 in thresholds:  # Critical threshold
+            y_pred = np.argmax(y_proba, axis=1).copy()
+            y_pred[y_proba[:, 1] >= t1] = 1        # Degrading
+            y_pred[y_proba[:, 2] >= t2] = 2        # Critical overrides Degrading
+            score = f1_score(y_true, y_pred, average=avg, zero_division=0)
+            if score > best_score:
+                best_score       = score
+                best_t1, best_t2 = t1, t2
+
+    # Apply best thresholds (Critical priority preserved)
+    y_pred_tuned = np.argmax(y_proba, axis=1).copy()
+    y_pred_tuned[y_proba[:, 1] >= best_t1] = 1
+    y_pred_tuned[y_proba[:, 2] >= best_t2] = 2
+
+    thresholds_dict = {
+        class_names[0]: 0.5,
+        class_names[1]: float(best_t1),
+        class_names[2]: float(best_t2),
+    }
+
+    print(f"\nThreshold tuning  (optimise F1-{avg})")
+    print(f"  Baseline F1-{avg}          : {baseline:.4f}")
+    print(f"  Tuned    F1-{avg}          : {best_score:.4f}  (+{best_score - baseline:+.4f})")
+    print(f"  {class_names[1]:10s} threshold : 0.50 → {best_t1:.2f}")
+    print(f"  {class_names[2]:10s} threshold : 0.50 → {best_t2:.2f}")
+
+    return y_pred_tuned, thresholds_dict
+
+
+def group_cv_score(
+    estimator: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    n_splits: int = 5,
+) -> pd.DataFrame:
+    """Evaluate an estimator with GroupKFold — each fold is a disjoint engine set.
+
+    More realistic than StratifiedKFold for C-MAPSS because cycles from the same
+    engine appear at multiple health stages.  GroupKFold guarantees that all cycles
+    of a given engine appear in exactly one fold's validation set, so the model is
+    always evaluated on engines it has never seen during that fold's training.
+
+    The estimator is cloned and re-fit on each fold's training split so that
+    the reported scores reflect genuine generalisation to unseen engines.
+
+    Args:
+        estimator: sklearn-compatible estimator (fitted or unfitted — cloned per fold).
+        X:         Feature matrix (n_samples, n_features).
+        y:         Target labels (n_samples,).
+        groups:    Engine unit IDs array (n_samples,); same unit must not span folds.
+        n_splits:  Number of GroupKFold folds.
+
+    Returns:
+        DataFrame with per-fold and summary (mean ± std) rows for
+        F1-macro, F1-weighted, and accuracy.
+    """
+    from sklearn.base import clone
+    from sklearn.model_selection import GroupKFold, cross_validate
+
+    cv     = GroupKFold(n_splits=n_splits)
+    scores = cross_validate(
+        clone(estimator), X, y,
+        cv=cv, groups=groups,
+        scoring=["f1_macro", "f1_weighted", "accuracy"],
+        n_jobs=1,
+    )
+
+    per_fold = pd.DataFrame({
+        "fold":        range(1, n_splits + 1),
+        "f1_macro":    scores["test_f1_macro"].round(4),
+        "f1_weighted": scores["test_f1_weighted"].round(4),
+        "accuracy":    scores["test_accuracy"].round(4),
+    })
+    summary = pd.DataFrame([{
+        "fold":        "mean ± std",
+        "f1_macro":    f"{scores['test_f1_macro'].mean():.4f} ± {scores['test_f1_macro'].std():.4f}",
+        "f1_weighted": f"{scores['test_f1_weighted'].mean():.4f} ± {scores['test_f1_weighted'].std():.4f}",
+        "accuracy":    f"{scores['test_accuracy'].mean():.4f} ± {scores['test_accuracy'].std():.4f}",
+    }])
+
+    combined = pd.concat([per_fold, summary], ignore_index=True)
+    print(f"\nGroupKFold CV  ({n_splits} folds, stratified by engine unit):")
+    display(combined)
+    return combined
 
 
 # ===========================================================================

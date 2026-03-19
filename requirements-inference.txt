@@ -12,6 +12,8 @@ scipy==1.13.1    # required by feature_engineering rolling stats
 # Machine learning (model loading + prediction only)
 scikit-learn==1.5.0
 lightgbm==4.3.0
+xgboost==2.1.0
+joblib==1.4.2              # required for cond_normaliser.pkl loading in inference_api.py
 
 # MLflow model registry (load saved model)
 mlflow==2.14.3

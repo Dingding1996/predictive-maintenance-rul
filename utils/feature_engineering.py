@@ -5,22 +5,29 @@ pandas-based feature engineering for NASA C-MAPSS.
 Feature families:
   - Rolling statistics   : mean, std, min, max over a configurable window
   - Delta features       : first-difference (rate-of-change) per sensor
+  - Long-window mean     : slow-trend rolling mean over a wider window (default 100)
+  - Slope (momentum)     : short_mean − long_mean; positive = sensor rising recently
   - Cycle normalisation  : time_cycles normalised to [0, 1] per unit
   - Min-max scaling      : fit on training data, applied to any split
 
 Usage::
 
-    from utils.dsp_features import add_rolling_features, get_feature_cols
-    df_feat = add_rolling_features(df, sensor_cols=USEFUL_SENSORS, window_size=30)
-    feature_cols = get_feature_cols(USEFUL_SENSORS)
+    from utils.feature_engineering import (
+        add_rolling_features_spark, add_long_window_features, get_feature_cols,
+    )
+    df_feat = add_rolling_features_spark(df, sensor_cols=USEFUL_SENSORS, window_size=30)
+    df_feat = add_long_window_features(df_feat, sensor_cols=USEFUL_SENSORS)
+    feature_cols = get_feature_cols(USEFUL_SENSORS, include_long_window=True)
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
 
 DEFAULT_WINDOW_SIZE: int = 30
+LONG_WINDOW_SIZE: int   = 100
 STAT_SUFFIXES: list[str] = ["mean", "std", "min", "max", "delta"]
 
 
@@ -76,6 +83,63 @@ def add_rolling_features_spark(
 
 # Alias so existing notebook calls work unchanged
 add_rolling_features = add_rolling_features_spark
+
+
+def add_long_window_features(
+    df: pd.DataFrame,
+    sensor_cols: list[str],
+    long_window: int = LONG_WINDOW_SIZE,
+    short_window_col_suffix: str = "mean",
+) -> pd.DataFrame:
+    """Add slow-trend and momentum features using a longer rolling window.
+
+    Must be called **after** ``add_rolling_features_spark`` so that the
+    ``{col}_mean`` short-window columns already exist in ``df``.
+
+    Three feature families added per sensor:
+
+    * ``{col}_lw_mean``  — rolling mean over ``long_window`` cycles; captures
+      gradual degradation trends that are invisible in a 30-cycle window.
+    * ``{col}_lw_std``   — rolling std over ``long_window`` cycles; sensor variance
+      tends to increase during degradation, and a wider window reveals this earlier.
+    * ``{col}_slope``    — momentum proxy: ``short_mean − lw_mean``.
+      Positive → sensor recently above its long-term level (rising trend).
+      Negative → sensor recently below long-term level (declining / degrading).
+      Avoids expensive OLS computation while conveying directional drift.
+
+    Args:
+        df:                     Input DataFrame (must already contain ``{col}_mean``
+                                columns from ``add_rolling_features_spark``).
+        sensor_cols:            Sensor column names (un-suffixed, e.g. ``sensor_02``).
+        long_window:            Slow-trend window length in cycles (default 100).
+        short_window_col_suffix: Suffix of the short-window mean column (default
+                                 ``'mean'``; change only if a custom suffix was used).
+
+    Returns:
+        DataFrame with ``{col}_lw_mean`` and ``{col}_slope`` columns appended.
+    """
+    df = df.sort_values(["unit_nr", "time_cycles"]).copy()
+
+    for col in sensor_cols:
+        grouped = df.groupby("unit_nr")[col]
+
+        # Slow-trend mean — uses a wider window to track baseline degradation
+        lw_mean = grouped.transform(
+            lambda s, w=long_window: s.rolling(w, min_periods=1).mean()
+        ).astype(np.float32)
+        df[f"{col}_lw_mean"] = lw_mean
+
+        # Long-window std — variance tends to increase during degradation;
+        # 100-cycle std reveals this trend earlier than the 30-cycle version
+        df[f"{col}_lw_std"] = grouped.transform(
+            lambda s, w=long_window: s.rolling(w, min_periods=1).std(ddof=1).fillna(0)
+        ).astype(np.float32)
+
+        # Slope proxy: short_mean − long_mean (direction of recent drift)
+        short_mean_col = f"{col}_{short_window_col_suffix}"
+        df[f"{col}_slope"] = (df[short_mean_col] - lw_mean).astype(np.float32)
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +226,91 @@ apply_min_max = apply_min_max_spark
 
 
 # ---------------------------------------------------------------------------
+# Operating-condition normalisation
+# ---------------------------------------------------------------------------
+
+def fit_condition_normaliser(
+    df_train: pd.DataFrame,
+    op_cols: list[str],
+    sensor_cols: list[str],
+    n_clusters: int = 6,
+    random_state: int = 42,
+) -> tuple:
+    """Fit k-means operating-condition clusters and per-cluster z-score statistics.
+
+    For datasets with multiple operating regimes (e.g. C-MAPSS FD002/FD004),
+    sensor readings shift substantially across flight conditions.  This function
+    identifies operating-condition clusters and computes per-cluster mean/std —
+    fit on training data only to prevent leakage into the test split.
+
+    Args:
+        df_train:    Training DataFrame containing op_cols and sensor_cols.
+        op_cols:     Operational-setting columns used for cluster assignment.
+        sensor_cols: Sensor columns to z-score normalise.
+        n_clusters:  Number of operating-condition clusters (k for k-means).
+        random_state: Random seed for k-means reproducibility.
+
+    Returns:
+        Tuple (kmeans, cluster_stats):
+          - kmeans       : Fitted KMeans object.
+          - cluster_stats: Dict {cluster_id: {col: (mean, std)}}.
+    """
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    kmeans.fit(df_train[op_cols].values)
+
+    labels = kmeans.predict(df_train[op_cols].values)
+    cluster_stats: dict = {}
+    for c in range(n_clusters):
+        mask = labels == c
+        cluster_stats[c] = {
+            col: (
+                float(df_train.loc[mask, col].mean()),
+                float(df_train.loc[mask, col].std(ddof=1)) + 1e-8,
+            )
+            for col in sensor_cols
+        }
+    return kmeans, cluster_stats
+
+
+def apply_condition_normaliser(
+    df: pd.DataFrame,
+    kmeans,
+    cluster_stats: dict,
+    op_cols: list[str],
+    sensor_cols: list[str],
+) -> pd.DataFrame:
+    """Apply pre-fit operating-condition z-score normalisation to a DataFrame.
+
+    Assigns each row to the nearest operating-condition cluster (using the
+    pre-fit k-means) and standardises each sensor column within its cluster
+    using the training-split mean and std.
+
+    Args:
+        df:            DataFrame to normalise (train or test split).
+        kmeans:        Fitted KMeans from fit_condition_normaliser.
+        cluster_stats: Per-cluster stats dict from fit_condition_normaliser.
+        op_cols:       Operational-setting columns for cluster assignment.
+        sensor_cols:   Sensor columns to normalise.
+
+    Returns:
+        DataFrame with sensor columns replaced by within-cluster z-scores.
+    """
+    df = df.copy()
+    labels = kmeans.predict(df[op_cols].values)
+    df["_cond_cluster"] = labels
+
+    for c, stats in cluster_stats.items():
+        mask = df["_cond_cluster"] == c
+        if not mask.any():
+            continue
+        for col in sensor_cols:
+            mean, std = stats[col]
+            df.loc[mask, col] = ((df.loc[mask, col] - mean) / std).astype(np.float32)
+
+    return df.drop(columns=["_cond_cluster"])
+
+
+# ---------------------------------------------------------------------------
 # LSTM sequence construction
 # ---------------------------------------------------------------------------
 
@@ -210,13 +359,21 @@ def create_lstm_sequences(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_new_feature_cols(sensor_cols: list[str], include_delta: bool) -> list[str]:
+def _get_new_feature_cols(
+    sensor_cols: list[str],
+    include_delta: bool,
+    include_long_window: bool = False,
+) -> list[str]:
     cols: list[str] = []
     for c in sensor_cols:
         for suf in ["mean", "std", "min", "max"]:
             cols.append(f"{c}_{suf}")
         if include_delta:
             cols.append(f"{c}_delta")
+        if include_long_window:
+            cols.append(f"{c}_lw_mean")
+            cols.append(f"{c}_lw_std")
+            cols.append(f"{c}_slope")
     return cols
 
 
@@ -226,15 +383,18 @@ def get_feature_cols(
     include_norm_cycle: bool = True,
     include_op_settings: bool = True,
     op_settings: list[str] | None = None,
+    include_long_window: bool = False,
 ) -> list[str]:
     """Return the complete ordered list of feature column names for modelling.
 
     Args:
-        sensor_cols:         Sensor columns used during feature engineering.
-        include_delta:       Whether delta features were computed.
-        include_norm_cycle:  Whether norm_cycle was added.
-        include_op_settings: Whether operational setting columns are included.
-        op_settings:         Names of operational-setting columns.
+        sensor_cols:          Sensor columns used during feature engineering.
+        include_delta:        Whether delta features were computed.
+        include_norm_cycle:   Whether norm_cycle was added.
+        include_op_settings:  Whether operational setting columns are included.
+        op_settings:          Names of operational-setting columns.
+        include_long_window:  Whether long-window mean and slope features were
+                              added via ``add_long_window_features``.
 
     Returns:
         Ordered list of feature column names.
@@ -244,5 +404,5 @@ def get_feature_cols(
         feature_cols += (op_settings or ["op_setting_1", "op_setting_2", "op_setting_3"])
     if include_norm_cycle:
         feature_cols.append("norm_cycle")
-    feature_cols += _get_new_feature_cols(sensor_cols, include_delta)
+    feature_cols += _get_new_feature_cols(sensor_cols, include_delta, include_long_window)
     return feature_cols

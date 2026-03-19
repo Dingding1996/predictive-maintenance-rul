@@ -4,7 +4,7 @@ FastAPI inference server for the turbofan engine health classifier.
 
 Loads the best FLAML AutoML model from the MLflow Model Registry and exposes:
 
-  POST /predict_file  — upload a C-MAPSS .txt file; API takes last 30 cycles for a given unit
+  POST /predict_file  — upload a C-MAPSS .txt file; API takes last 100 cycles for a given unit
   GET  /health        — liveness probe + model metadata
 
 Run locally::
@@ -46,9 +46,12 @@ from utils.ml_classification import CLASS_NAMES  # noqa: E402
 from utils.data_loader import USEFUL_SENSORS, OP_SETTINGS, COLUMN_NAMES  # noqa: E402
 from utils.feature_engineering import (  # noqa: E402
     add_rolling_features_spark,
-    add_cycle_normalisation_spark,
+    add_long_window_features,
+    apply_condition_normaliser,
     apply_min_max_spark,
     get_feature_cols,
+    DEFAULT_WINDOW_SIZE,
+    LONG_WINDOW_SIZE,
 )
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,16 @@ async def lifespan(_app: FastAPI):
     else:
         print("  [scale]   WARNING — models/scale_params.json not found. "
               "Re-run Section 5 of the notebook with scale_params=scale_params.")
+
+    # Load condition normaliser (k-means + per-cluster stats) for FD002/FD004
+    cond_path = _BASE_DIR / "models" / "cond_normaliser.pkl"
+    if cond_path.exists():
+        import joblib
+        _REGISTRY["cond_normaliser"] = joblib.load(cond_path)
+        print(f"  [cond]    cond_normaliser loaded (k={_REGISTRY['cond_normaliser'][0].n_clusters} clusters)")
+    else:
+        print("  [cond]    WARNING — models/cond_normaliser.pkl not found. "
+              "Re-run Section 5 of the notebook with cond_normaliser=(cond_kmeans, cond_stats).")
     yield
     print("Shutting down — clearing model registry.")
     _REGISTRY.clear()
@@ -196,21 +209,22 @@ def health_check() -> dict:
 async def predict_file(
     file: UploadFile = File(..., description="C-MAPSS test .txt file (space-delimited, no header)."),
     unit_id: int = Query(1, description="Engine unit ID to predict (must exist in the file)."),
-    window: int = Query(30, ge=1, description="Number of most recent cycles to use for rolling features."),
 ) -> PredictResponse:
     """
     Classify engine health from an uploaded C-MAPSS test file.
 
     Upload any `test_FD00X.txt` file from the NASA C-MAPSS dataset.
-    The API automatically selects the last `window` cycles for the specified
+    The API automatically selects the most recent cycles for the specified
     engine unit, runs the full feature engineering pipeline server-side,
     and returns a health prediction.
+
+    Rolling window sizes are fixed to match training:
+    short window = 30 cycles (DEFAULT_WINDOW_SIZE), long window = 100 cycles (LONG_WINDOW_SIZE).
 
     Args:
         file:    C-MAPSS .txt file — space-delimited, no header, 26 columns
                  (unit_nr, time_cycles, 3 op_settings, 21 sensors).
         unit_id: Engine unit number to evaluate (default: 1).
-        window:  Rolling window size in cycles (default: 30, matches training).
 
     Returns:
         Predicted health label, class index, probabilities, and run ID.
@@ -246,22 +260,42 @@ async def predict_file(
             detail=f"unit_id {unit_id} not found in file. Available units: {available}",
         )
 
-    # Take the last `window` cycles — more cycles give rolling stats that better
-    # match the training distribution
+    # Take enough cycles to populate both short and long rolling windows.
+    # lw_mean requires LONG_WINDOW_SIZE (100) cycles of history; taking fewer
+    # would produce lw_mean values that diverge from the training distribution.
+    cycles_needed = max(DEFAULT_WINDOW_SIZE, LONG_WINDOW_SIZE)
     unit_df = (
         df[df["unit_nr"] == unit_id]
         .sort_values("time_cycles")
-        .tail(window)
+        .tail(cycles_needed)
         .reset_index(drop=True)
     )
     unit_df["time_cycles"] = range(1, len(unit_df) + 1)
 
+    cond_normaliser = _REGISTRY.get("cond_normaliser")
+
     try:
-        unit_df      = add_rolling_features_spark(unit_df, sensor_cols=USEFUL_SENSORS, window_size=window)
-        unit_df      = add_cycle_normalisation_spark(unit_df)
-        # include_norm_cycle=False matches training (notebook Section 3b)
-        feature_cols = get_feature_cols(USEFUL_SENSORS, op_settings=OP_SETTINGS, include_norm_cycle=False)
-        unit_df      = apply_min_max_spark(unit_df, scale_params, feature_cols)
+        # Step 1 — condition normalisation (z-score within operating-condition cluster)
+        # Must happen before rolling features, matching the training pipeline exactly.
+        if cond_normaliser is not None:
+            kmeans, cluster_stats = cond_normaliser
+            unit_df = apply_condition_normaliser(
+                unit_df, kmeans, cluster_stats, OP_SETTINGS, USEFUL_SENSORS
+            )
+        # Step 2 — short rolling features (30 cycles, fixed to match training)
+        unit_df = add_rolling_features_spark(unit_df, sensor_cols=USEFUL_SENSORS, window_size=DEFAULT_WINDOW_SIZE)
+        # Step 3 — long-window features (lw_mean + slope, 100 cycles)
+        # Must run after add_rolling_features_spark — slope = short_mean − lw_mean
+        unit_df = add_long_window_features(unit_df, sensor_cols=USEFUL_SENSORS, long_window=LONG_WINDOW_SIZE)
+        # include_norm_cycle=False, include_long_window=True matches training pipeline exactly
+        feature_cols = get_feature_cols(
+            USEFUL_SENSORS,
+            op_settings=OP_SETTINGS,
+            include_norm_cycle=False,
+            include_long_window=True,
+        )
+        # Step 4 — min-max scaling with training-fit parameters
+        unit_df = apply_min_max_spark(unit_df, scale_params, feature_cols)
 
         X      = unit_df[feature_cols].iloc[[-1]].values.astype(np.float32)
         y_pred = model.predict(X)

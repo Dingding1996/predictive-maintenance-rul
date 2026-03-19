@@ -17,7 +17,12 @@ seaborn==0.13.2
 # --- Machine learning ---
 scikit-learn==1.5.0
 xgboost==2.1.0
+lightgbm==4.3.0
 joblib==1.4.2
+
+# --- AutoML & experiment tracking ---
+flaml==2.3.0
+mlflow==2.14.3
 
 # --- Deep learning (optional — LSTM model) ---
 # Install separately if GPU support is needed:
@@ -31,6 +36,8 @@ shap==0.44.1
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.1
+python-multipart==0.0.9   # required for FastAPI file upload (UploadFile)
+pyyaml==6.0.1             # MLflow model registry path resolution in inference_api.py
 
 # --- Dataset download ---
 kagglehub==0.2.9

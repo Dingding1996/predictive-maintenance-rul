@@ -1,0 +1,24 @@
+# Predictive Maintenance — Inference Service Dependencies
+# ========================================================
+# Minimal subset of requirements.txt — training-only packages excluded:
+#   tensorflow, jupyter, matplotlib, seaborn, shap, kagglehub, flaml
+# ========================================================
+
+# Core data
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1    # required by feature_engineering rolling stats
+
+# Machine learning (model loading + prediction only)
+scikit-learn==1.5.0
+lightgbm==4.3.0
+
+# MLflow model registry (load saved model)
+mlflow==2.14.3
+
+# Inference API
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.1
+python-multipart==0.0.9    # required for FastAPI file upload (UploadFile)
+pyyaml==6.0.1              # MLflow model registry path resolution

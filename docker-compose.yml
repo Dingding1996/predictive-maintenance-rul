@@ -1,0 +1,41 @@
+# =============================================================
+# Predictive Maintenance — Local Compose Stack
+# =============================================================
+# Usage:
+#   docker compose up --build      # first run (builds image)
+#   docker compose up              # subsequent runs
+#   docker compose down            # stop and remove containers
+#
+# API will be available at:
+#   http://localhost:8001/predict
+#   http://localhost:8001/docs     (Swagger UI)
+#   http://localhost:8001/health   (liveness probe)
+#
+# Port 8001 is used to avoid conflict with the bearing-fault-diagnosis
+# service which occupies 8000.
+# =============================================================
+
+services:
+  api:
+    build: .
+    image: turbofan-health-api:latest
+    container_name: turbofan-health-api
+    ports:
+      - "8001:8000"
+    volumes:
+      # Mount trained model artefacts read-only.
+      # Run PredictiveMaintenance_Training.ipynb on the host first to populate mlruns/.
+      - ./mlruns:/app/mlruns:ro
+      # Mount models/ for scale_params.json (needed by /predict_raw endpoint).
+      - ./models:/app/models:ro
+    environment:
+      # Suppress MLflow progress bars in container logs
+      - MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

@@ -11,6 +11,9 @@ data/
 !data/.gitkeep
 !data/raw/.gitkeep
 
+# ----- MLflow experiment tracking (large — regenerate by running notebook) --
+mlruns/
+
 # ----- Trained models (large binary artefacts — regenerate via notebook) --
 models/
 !models/.gitkeep

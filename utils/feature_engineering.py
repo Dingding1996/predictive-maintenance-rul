@@ -5,7 +5,7 @@ pandas-based feature engineering for NASA C-MAPSS.
 Feature families:
   - Rolling statistics   : mean, std, min, max over a configurable window
   - Delta features       : first-difference (rate-of-change) per sensor
-  - Long-window mean     : slow-trend rolling mean over a wider window (default 100)
+  - Long-window mean     : slow-trend rolling mean over a wider window (default 60)
   - Slope (momentum)     : short_mean − long_mean; positive = sensor rising recently
   - Cycle normalisation  : time_cycles normalised to [0, 1] per unit
   - Min-max scaling      : fit on training data, applied to any split
@@ -27,7 +27,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 
 DEFAULT_WINDOW_SIZE: int = 30
-LONG_WINDOW_SIZE: int   = 100
+LONG_WINDOW_SIZE: int   = 60
 STAT_SUFFIXES: list[str] = ["mean", "std", "min", "max", "delta"]
 
 

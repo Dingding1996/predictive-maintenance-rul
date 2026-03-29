@@ -165,8 +165,8 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Turbofan Engine Health Classification API",
     description=(
-        "3-class health classification for NASA C-MAPSS turbofan engines.\n\n"
-        "**Classes:** `0 = Healthy` | `1 = Degrading` | `2 = Critical`\n\n"
+        "Binary engine health classification for NASA C-MAPSS turbofan engines.\n\n"
+        "**Classes:** `0 = Healthy` | `1 = Non-Healthy`\n\n"
         "**Model:** Best estimator selected by FLAML AutoML, registered in MLflow.\n\n"
         "Upload a C-MAPSS test file to `POST /predict_file` — the full feature "
         "engineering pipeline runs server-side."
@@ -184,7 +184,7 @@ class PredictResponse(BaseModel):
 
     predictions:   list[int]         = Field(..., description="Predicted class index.")
     labels:        list[str]         = Field(..., description="Human-readable health label.")
-    probabilities: list[list[float]] = Field(..., description="Softmax probabilities [Healthy, Degrading, Critical].")
+    probabilities: list[list[float]] = Field(..., description="Softmax probabilities [Healthy, Non-Healthy].")
     estimator:     str               = Field(..., description="FLAML-selected model family (e.g. 'LGBMClassifier').")
     run_id:        str               = Field(..., description="MLflow run ID (first 8 chars) for audit trail.")
 
@@ -219,7 +219,7 @@ async def predict_file(
     and returns a health prediction.
 
     Rolling window sizes are fixed to match training:
-    short window = 30 cycles (DEFAULT_WINDOW_SIZE), long window = 100 cycles (LONG_WINDOW_SIZE).
+    short window = 30 cycles (DEFAULT_WINDOW_SIZE), long window = 60 cycles (LONG_WINDOW_SIZE).
 
     Args:
         file:    C-MAPSS .txt file — space-delimited, no header, 26 columns
@@ -261,7 +261,7 @@ async def predict_file(
         )
 
     # Take enough cycles to populate both short and long rolling windows.
-    # lw_mean requires LONG_WINDOW_SIZE (100) cycles of history; taking fewer
+    # lw_mean requires LONG_WINDOW_SIZE (60) cycles of history; taking fewer
     # would produce lw_mean values that diverge from the training distribution.
     cycles_needed = max(DEFAULT_WINDOW_SIZE, LONG_WINDOW_SIZE)
     unit_df = (

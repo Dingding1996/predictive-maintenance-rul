@@ -17,8 +17,10 @@
 
 services:
   api:
-    build: .
-    image: turbofan-health-api:latest
+    # Pull pre-built image from GitHub Container Registry (updated automatically by CI).
+    # To force a local build instead: comment out `image` and uncomment `build`.
+    image: ghcr.io/dingding1996/turbofan-health-api:latest
+    # build: .
     container_name: turbofan-health-api
     ports:
       - "8001:8000"

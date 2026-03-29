@@ -1,6 +1,6 @@
 # Predictive Maintenance — Turbofan Engine Health Classification
 
-Multi-class health classification on the NASA C-MAPSS turbofan engine dataset,
+Binary health classification on the NASA C-MAPSS turbofan engine dataset,
 demonstrating an end-to-end MLOps pipeline from raw sensor data to a containerised
 inference API with automated model selection and experiment tracking.
 
@@ -15,9 +15,11 @@ maintenance teams to intervene before catastrophic failure.
 
 | Class | RUL range | Meaning |
 |---|---|---|
-| Healthy (0) | > 80 cycles | Normal operation |
-| Degrading (1) | 31 – 80 cycles | Early-warning window |
-| Critical (2) | ≤ 30 cycles | Urgent maintenance required |
+| Healthy (0) | > threshold | Normal operation |
+| Non-Healthy (1) | ≤ threshold | Degradation detected — maintenance warranted |
+
+The threshold is selected data-driven via an ExtraTrees proxy grid-search on training
+data (default: RUL > 80 → Healthy).
 
 ---
 
@@ -81,9 +83,9 @@ Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explain
 | 2. EDA | Class distribution, sensor degradation trends, correlation heatmap |
 | 3. Preprocessing | RUL labelling → data-driven threshold search → operating-condition normalisation → 30-cycle rolling features → 100-cycle long-window features (lw_mean, lw_std, slope) → min-max scaling |
 | 4. Model Definition | FLAML AutoML configuration; optional LSTM sequence model |
-| 5. AutoML & Model Selection | FLAML searches LightGBM / XGBoost / RF / linear models; best run logged to MLflow |
-| 6. Evaluation | Test-set metrics (accuracy, F1-macro, F1-weighted) on unseen engines |
-| 7. Visualisations | Confusion matrices, feature importance, LSTM training curves |
+| 5. AutoML & Model Selection | FLAML searches LightGBM / XGBoost / RF / linear models with engine-level GroupKFold CV, optimising F1; best run logged to MLflow |
+| 6. Evaluation | Test-set metrics (accuracy, precision, recall, F1) — test set touched exactly once |
+| 7. Visualisations | Confusion matrices (default vs tuned threshold), feature importance, LSTM training curves |
 | 8. Explainability | SHAP TreeExplainer — beeswarm + global bar chart |
 | 9. Summary | Key findings and limitations |
 
@@ -93,12 +95,14 @@ Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explain
 
 ### FLAML AutoML (primary)
 - Searches over LightGBM, XGBoost, Random Forest, Extra Trees, and linear models
-- Optimises F1-weighted using a cost-frugal Bayesian search strategy
+- Directly optimises **F1** — fault detection as the positive class
+- **Engine-level GroupKFold CV** — whole engines are held out per fold, eliminating same-engine cycle leakage
 - Best model and hyperparameters registered automatically in MLflow Model Registry
 - Input: flat feature vector (115 features per cycle: 14 sensors × 8 statistics + 3 op_settings)
+- Decision threshold tuned on a held-out validation fold to further maximise F1
 
 ### LSTM (optional — requires TensorFlow)
-- Input: sequences of engineered features `(30 cycles × 115 features)` — same feature set as AutoML
+- Input: sequences of engineered features `(100 cycles × 115 features)` — same feature set as AutoML
 - 2-layer LSTM (128 → 64 units) with dropout, early stopping, and class-weighted training
 - Captures temporal degradation patterns across consecutive cycles end-to-end
 
@@ -107,33 +111,26 @@ Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explain
 ## Key Results
 
 > Results below are from the current clean pipeline: official engine-level train/test split,
-> operating-condition normalisation, and leakage-free scaling. Re-run the notebook to reproduce.
+> engine-level GroupKFold CV inside FLAML, operating-condition normalisation, and leakage-free scaling.
+> Re-run the notebook to reproduce.
 
-| Model | CV F1-weighted | Test F1-weighted | Test F1-macro | Test Accuracy |
-|---|---|---|---|---|
-| **FLAML AutoML (LightGBM)** | — | — | — | — |
-| LSTM | — | — | — | — |
+| Model | CV F1 | Test F1  | Test Accuracy |
+|---|---|---|---|
+| **FLAML AutoML — default thr** | — | — | — |
+| **FLAML AutoML — tuned thr** | — | — | — |
+| LSTM | — | — | — |
 
-*Numbers to be updated after notebook re-run with the corrected pipeline.*
-
-**Previous results (row-level split, no condition normalisation — inflated by leakage):**
-
-| Model | Test F1-weighted | Test Accuracy |
-|---|---|---|
-| FLAML AutoML (LightGBM) | 0.9877 | 0.9877 |
-
-Those numbers should not be compared against the current pipeline — the evaluation setup was fundamentally different (test cycles from the same engines seen in training).
+*Re-run the notebook (Restart → Run All) to populate these numbers.*
 
 ---
 
 ## Explainability
 
-SHAP values identify the most predictive features for the **Critical** class
-(update after re-run — list below reflects previous pipeline):
+SHAP values identify the most predictive features for the **Non-Healthy** class:
 
 - `sensor_14_mean` / `sensor_14_std` — core speed tracks late-stage degradation
 - `sensor_11_mean` — HPC static pressure rises with compressor fouling
-- `sensor_04_delta` — rate-of-change in LPT outlet temperature
+- `sensor_04_delta` — rate-of-change in LPT outlet temperature detects abrupt deterioration
 
 Note: `norm_cycle` is **excluded** from features — it encodes lifecycle position derived
 from the failure point and constitutes target leakage.
@@ -157,7 +154,7 @@ Each run records:
 - All Section 0 constants (window size, RUL thresholds, number of op-condition clusters, etc.)
 - FLAML search configuration (time budget, metric)
 - Best estimator name and hyperparameters
-- CV F1-weighted, test accuracy, test F1-macro, test F1-weighted
+- CV F1 best, test accuracy, test F1
 - Trained model artifact with input/output schema
 
 ---
@@ -190,7 +187,7 @@ docker compose up --build
 ```bash
 curl -X POST "http://localhost:8001/predict_file?unit_id=1" \
   -F "file=@data/raw/test_FD001.txt"
-# → {"labels": ["Healthy"], "predictions": [0], "probabilities": [[0.91, 0.07, 0.02]], ...}
+# → {"labels": ["Healthy"], "predictions": [0], "probabilities": [[0.94, 0.06]], ...}
 ```
 
 The `mlruns/` and `models/` directories are **mounted as read-only volumes** — not
@@ -199,16 +196,20 @@ is all that is needed to deploy a new model version.
 
 ---
 
-## CI/CD Design
+## CI/CD
 
-The training pipeline is designed for CI/CD integration via GitHub Actions.
-On each merge to `main`, the notebook can be executed automatically, the new
-model version registered to MLflow, and the container restarted to serve the
-updated model — decoupling training from deployment.
+Pushing to `main` automatically rebuilds and publishes the Docker inference image
+via GitHub Actions (`.github/workflows/docker.yml`).  The image is hosted on
+GitHub Container Registry (`ghcr.io`) and pulled by `docker-compose.yml` at runtime.
 
 ```
-git push → GitHub Actions → jupyter nbconvert --execute → MLflow register → docker compose restart
+git push → GitHub Actions → docker build → ghcr.io/…/turbofan-health-api:latest
+                                         → docker compose up (pulls new image)
 ```
+
+Training is intentionally kept as a **local step** — run the notebook, commit
+the updated `mlruns/`, then push. The container mounts `mlruns/` as a read-only
+volume so no retraining happens inside Docker.
 
 ---
 
@@ -239,7 +240,7 @@ jupyter lab PredictiveMaintenance_Training.ipynb
 
 ## Limitations & Next Steps
 
-- Health-class thresholds are searched data-driven (ExtraTrees proxy grid search) but remain a proxy for true maintenance economics; a cost-sensitive objective could further improve Critical recall
+- The Healthy/Non-Healthy threshold is searched data-driven (ExtraTrees proxy) but remains a proxy for true maintenance economics; a cost-sensitive objective weighting missed faults higher than false alarms would better align with real-world deployment
 - Transformer-based sequence models (e.g. Temporal Fusion Transformer) may outperform
   LSTM with less hyperparameter tuning
 - The k-means operating-condition clustering uses k=6 (matching FD002/FD004's known

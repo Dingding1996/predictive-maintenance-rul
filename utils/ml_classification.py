@@ -7,8 +7,8 @@ Two model families are provided:
                     rolling features (sklearn-compatible interface, MLflow tracking)
   2. LSTM          — sequence classifier on raw sensor windows (Keras / TensorFlow)
 
-Both are trained to predict one of three health classes:
-  0 = Healthy | 1 = Degrading | 2 = Critical
+Both are trained to predict one of two health classes:
+  0 = Healthy | 1 = Non-Healthy
 
 Usage::
 
@@ -30,27 +30,27 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix, f1_score,
+    classification_report, confusion_matrix, f1_score,
 )
 
 # ---------------------------------------------------------------------------
-# FLAML custom metric — f1_weighted
+# FLAML custom metric — F1 (Non-Healthy, pos_label=1)
 # ---------------------------------------------------------------------------
-# FLAML 2.3.x built-ins do not include 'f1_weighted'; we supply it as a
-# callable.  Signature required by FLAML: returns (val_loss, metrics_dict)
-# where val_loss is minimised (so loss = 1 − f1_weighted).
+# FLAML 2.3.x does not include a binary F1 (pos_label=1) built-in; we supply
+# it as a callable.  Signature required by FLAML: returns (val_loss, metrics_dict)
+# where val_loss is minimised (so loss = 1 − F1_NonHealthy).
 
-def _flaml_f1_weighted(
+def _flaml_f1_nonhealthy(
     X_val, y_val, estimator, labels,
     X_train, y_train,
     weight_val=None, weight_train=None,
     *args,
 ):
-    """Custom FLAML metric: minimise 1 − F1-weighted."""
-    y_pred    = estimator.predict(X_val)
-    f1w       = f1_score(y_val, y_pred, average="weighted", zero_division=0)
-    val_loss  = 1.0 - f1w
-    return val_loss, {"f1_weighted": f1w}
+    """Custom FLAML metric: minimise 1 − F1 (Non-Healthy, pos_label=1)."""
+    y_pred        = estimator.predict(X_val)
+    f1_nonhealthy = f1_score(y_val, y_pred, pos_label=1, zero_division=0)
+    val_loss      = 1.0 - f1_nonhealthy
+    return val_loss, {"F1": f1_nonhealthy}
 
 # Lazy import TensorFlow so the module loads even without TF installed
 _tf_available: bool = False
@@ -67,7 +67,7 @@ except ImportError:
         stacklevel=2,
     )
 
-CLASS_NAMES: list[str] = ["Healthy", "Degrading", "Critical"]
+CLASS_NAMES: list[str] = ["Healthy", "Non-Healthy"]
 N_CLASSES: int = len(CLASS_NAMES)
 
 
@@ -79,7 +79,7 @@ def run_automl_with_mlflow(
     X_train: np.ndarray,
     y_train: np.ndarray,
     time_budget: int = 300,
-    metric: str = "f1_weighted",
+    metric: str = "F1",
     experiment_name: str = "automl-experiment",
     tracking_uri: str = "./mlruns",
     extra_params: dict | None = None,
@@ -100,7 +100,8 @@ def run_automl_with_mlflow(
         y_train:         Integer-encoded class labels.
         time_budget:     Maximum search time in seconds (FLAML budget).
         metric:          Optimisation metric passed to FLAML
-                         ('f1_weighted', 'accuracy', 'log_loss', etc.).
+                         ('F1' uses the custom callable; other strings
+                         are passed directly to FLAML's built-ins).
         experiment_name: MLflow experiment name (created if absent).
         tracking_uri:    MLflow tracking URI. Use a local path (e.g. './mlruns')
                          for file-based tracking — no server required.
@@ -110,7 +111,7 @@ def run_automl_with_mlflow(
         sample_weight:   Per-sample weights passed to FLAML AutoML.  Use
                          ``sklearn.utils.class_weight.compute_sample_weight``
                          to counter class imbalance directly in the loss function,
-                         complementing the F1-weighted optimisation metric.
+                         complementing the F1 (Non-Healthy) optimisation metric.
         groups:          Engine unit ID array (n_samples,).  When provided, FLAML
                          uses GroupKFold internally so each CV fold's validation set
                          contains engines that were never seen during that fold's
@@ -130,7 +131,7 @@ def run_automl_with_mlflow(
               · ``automl.best_estimator``     — winning model family name.
               · ``automl.best_config``        — best hyperparameter config.
               · ``automl.model.estimator``    — raw sklearn estimator (for SHAP).
-          - cv_results DataFrame with per-estimator best F1-weighted scores,
+          - cv_results DataFrame with per-estimator best F1 (Non-Healthy) scores,
             sorted descending. Mirrors the ``cv_results`` convention used
             elsewhere in the notebook.
 
@@ -155,41 +156,37 @@ def run_automl_with_mlflow(
     with mlflow.start_run(run_name="flaml_automl") as run:
 
         # --- Log all Section 0 constants + search configuration ---
+        cv_strategy = "GroupKFold" if groups is not None else "StratifiedKFold"
         search_params: dict[str, Any] = {
             "time_budget_s": time_budget,
             "metric":        metric,
             "random_state":  random_state,
-            "sample_weight": "balanced" if sample_weight is not None else "none",
-            "cv_strategy":   "GroupKFold" if groups is not None else "StratifiedKFold",
+            "cv_strategy":   cv_strategy,
         }
         if extra_params:
             search_params.update(extra_params)
         mlflow.log_params(search_params)
 
         # --- Run FLAML automated search ---
-        # Use the custom callable for f1_weighted (not a FLAML 2.3.x built-in).
-        # Fall back to the string for any other metric that FLAML supports natively.
-        flaml_metric = _flaml_f1_weighted if metric == "f1_weighted" else metric
-
-        # Note: FLAML does not support sample_weight + groups simultaneously in this
-        # version (AutoMLState.sample_weight_all is not initialised when groups is set).
-        # groups is therefore omitted here; engine-level GroupKFold evaluation is
-        # performed separately in Section 5b via group_cv_score().
+        # Pass groups so FLAML uses GroupKFold internally — each CV fold holds out
+        # entire engines, preventing same-engine cycles from leaking across folds.
+        # FLAML does not support sample_weight + groups simultaneously; class
+        # imbalance is handled by the F1 (Non-Healthy) metric and threshold tuning.
         automl = AutoML()
         automl.fit(
             X_train, y_train,
             task="classification",
-            metric=flaml_metric,
+            metric=_flaml_f1_nonhealthy,
             time_budget=time_budget,
             seed=random_state,
             n_jobs=1,      # Windows: n_jobs=-1 causes PermissionError on joblib temp files
             verbose=1,
-            sample_weight=sample_weight,  # None → uniform weights (default behaviour)
+            groups=groups, # engine-level CV folds — eliminates within-engine leakage
         )
 
         # --- Log best results ---
-        best_f1 = 1.0 - automl.best_loss   # FLAML minimises loss = 1 − metric
-        mlflow.log_metric("cv_f1_weighted_best", best_f1)
+        best_f1 = 1.0 - automl.best_loss   # FLAML minimises loss = 1 − F1_NonHealthy
+        mlflow.log_metric("cv_F1_best", best_f1)
         mlflow.log_param("best_estimator", automl.best_estimator)
         mlflow.log_param("best_config",    str(automl.best_config))
 
@@ -240,7 +237,7 @@ def run_automl_with_mlflow(
         print(f"{'=' * 50}")
         print(f"  MLflow run ID   : {run.info.run_id}")
         print(f"  Best estimator  : {automl.best_estimator}")
-        print(f"  CV F1-weighted  : {best_f1:.4f}  (1 − best_loss)")
+        print(f"  CV F1           : {best_f1:.4f}  (1 − best_loss, Non-Healthy)")
         print(f"  Best config     : {automl.best_config}")
 
     # --- Build cv_results summary (per-estimator best scores) ---
@@ -250,7 +247,7 @@ def run_automl_with_mlflow(
 
 
 def _build_cv_results(automl: Any) -> pd.DataFrame:
-    """Extract per-estimator best F1-weighted scores from a fitted FLAML object.
+    """Extract per-estimator best F1 (Non-Healthy) scores from a fitted FLAML object.
 
     Falls back to a single-row summary if FLAML's internal attribute is absent
     (API varies across versions).
@@ -259,7 +256,7 @@ def _build_cv_results(automl: Any) -> pd.DataFrame:
         automl: Fitted FLAML AutoML object.
 
     Returns:
-        DataFrame with columns ['estimator', 'f1_weighted'], sorted descending.
+        DataFrame with columns ['estimator', 'F1'], sorted descending.
     """
     if hasattr(automl, "best_config_per_estimator"):
         rows = []
@@ -274,20 +271,20 @@ def _build_cv_results(automl: Any) -> pd.DataFrame:
                 loss = info[0] if info else None
             if loss is not None:
                 rows.append({
-                    "estimator":   est,
-                    "f1_weighted": round(1.0 - loss, 4),
+                    "estimator":    est,
+                    "F1": round(1.0 - loss, 4),
                 })
         if rows:
             return (
                 pd.DataFrame(rows)
-                .sort_values("f1_weighted", ascending=False)
+                .sort_values("F1", ascending=False)
                 .reset_index(drop=True)
             )
 
     # Fallback — single-row summary from top-level attributes
     return pd.DataFrame({
-        "estimator":   [automl.best_estimator],
-        "f1_weighted": [round(1.0 - automl.best_loss, 4)],
+        "estimator":    [automl.best_estimator],
+        "F1": [round(1.0 - automl.best_loss, 4)],
     })
 
 
@@ -418,68 +415,51 @@ def tune_prediction_threshold(
     y_true: np.ndarray,
     y_proba: np.ndarray,
     class_names: list[str] = CLASS_NAMES,
-    optimize: str = "f1_macro",
+    optimize: str = "f1",
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Find per-class probability thresholds that maximise F1 macro (or weighted).
+    """Find the probability threshold for Non-Healthy that maximises F1.
 
-    The default argmax rule (threshold = 0.5 for every class) under-predicts
-    minority classes (Degrading, Critical) because their probabilities rarely
-    exceed 0.5.  Lowering the threshold for a minority class increases its
-    recall at a small precision cost — a worthwhile trade-off for maintenance
-    decisions where missing a fault is more costly than a false alarm.
+    Binary version: sweeps P(Non-Healthy) threshold over [0.10, 0.70].
+    The default rule (predict Non-Healthy when P ≥ 0.50) under-predicts the
+    minority class for imbalanced data; lowering the threshold recovers recall
+    at a precision cost that is acceptable in maintenance contexts.
 
-    Search strategy:
-      - Sweep Degrading threshold t1 and Critical threshold t2 over [0.10, 0.50].
-      - At each (t1, t2): predict Degrading if P(Degrading) ≥ t1, then override
-        to Critical if P(Critical) ≥ t2 (Critical takes priority).
-      - Select the (t1, t2) pair that maximises the chosen metric on y_true.
+    Should be called on a *validation* fold only — never on the test set.
 
     Args:
-        y_true:      Ground-truth integer labels (0=Healthy, 1=Degrading, 2=Critical).
-        y_proba:     Probability matrix shape (n_samples, n_classes).
+        y_true:      Ground-truth integer labels (0=Healthy, 1=Non-Healthy).
+        y_proba:     Probability matrix shape (n_samples, 2).
         class_names: Human-readable class names for the returned dict.
-        optimize:    Metric to maximise: ``'f1_macro'`` or ``'f1_weighted'``.
+        optimize:    ``'f1'`` for binary F1 (Non-Healthy, pos_label=1).
 
     Returns:
         Tuple (y_pred_tuned, thresholds_dict):
-          - y_pred_tuned:    Predictions using the best thresholds found.
+          - y_pred_tuned:    Predictions using the best threshold found.
           - thresholds_dict: ``{class_name: threshold}`` for logging / inference.
     """
-    avg      = optimize.replace("f1_", "")   # "macro" or "weighted"
-    baseline = f1_score(
-        y_true, np.argmax(y_proba, axis=1), average=avg, zero_division=0
-    )
+    # optimize="f1" → binary F1 with pos_label=1 (Non-Healthy)
+    def _score(y_true, y_pred):
+        return f1_score(y_true, y_pred, pos_label=1, average="binary", zero_division=0)
 
-    best_score      = baseline
-    best_t1, best_t2 = 0.5, 0.5
-    thresholds       = np.arange(0.10, 0.55, 0.05)
+    baseline   = _score(y_true, (y_proba[:, 1] >= 0.5).astype(int))
+    best_score = baseline
+    best_t     = 0.5
+    for t in np.arange(0.10, 0.75, 0.05):
+        y_pred = (y_proba[:, 1] >= t).astype(int)
+        score  = _score(y_true, y_pred)
+        if score > best_score:
+            best_score, best_t = score, t
 
-    for t1 in thresholds:      # Degrading threshold
-        for t2 in thresholds:  # Critical threshold
-            y_pred = np.argmax(y_proba, axis=1).copy()
-            y_pred[y_proba[:, 1] >= t1] = 1        # Degrading
-            y_pred[y_proba[:, 2] >= t2] = 2        # Critical overrides Degrading
-            score = f1_score(y_true, y_pred, average=avg, zero_division=0)
-            if score > best_score:
-                best_score       = score
-                best_t1, best_t2 = t1, t2
-
-    # Apply best thresholds (Critical priority preserved)
-    y_pred_tuned = np.argmax(y_proba, axis=1).copy()
-    y_pred_tuned[y_proba[:, 1] >= best_t1] = 1
-    y_pred_tuned[y_proba[:, 2] >= best_t2] = 2
-
+    y_pred_tuned = (y_proba[:, 1] >= best_t).astype(int)
     thresholds_dict = {
-        class_names[0]: 0.5,
-        class_names[1]: float(best_t1),
-        class_names[2]: float(best_t2),
+        class_names[0]: float(1.0 - best_t),
+        class_names[1]: float(best_t),
     }
 
-    print(f"\nThreshold tuning  (optimise F1-{avg})")
-    print(f"  Baseline F1-{avg}          : {baseline:.4f}")
-    print(f"  Tuned    F1-{avg}          : {best_score:.4f}  (+{best_score - baseline:+.4f})")
-    print(f"  {class_names[1]:10s} threshold : 0.50 → {best_t1:.2f}")
-    print(f"  {class_names[2]:10s} threshold : 0.50 → {best_t2:.2f}")
+    print(f"\nThreshold tuning  (optimise F1 Non-Healthy)")
+    print(f"  Baseline F1                    : {baseline:.4f}")
+    print(f"  Tuned    F1                    : {best_score:.4f}  ({best_score - baseline:+.4f})")
+    print(f"  {class_names[1]:12s} threshold : 0.50 → {best_t:.2f}")
 
     return y_pred_tuned, thresholds_dict
 
@@ -510,30 +490,28 @@ def group_cv_score(
 
     Returns:
         DataFrame with per-fold and summary (mean ± std) rows for
-        F1-macro, F1-weighted, and accuracy.
+        F1 (Non-Healthy).
     """
     from sklearn.base import clone
     from sklearn.model_selection import GroupKFold, cross_validate
+    from sklearn.metrics import make_scorer
 
     cv     = GroupKFold(n_splits=n_splits)
+    f1_nonhealthy_scorer = make_scorer(f1_score, pos_label=1, zero_division=0)
     scores = cross_validate(
         clone(estimator), X, y,
         cv=cv, groups=groups,
-        scoring=["f1_macro", "f1_weighted", "accuracy"],
+        scoring={"F1": f1_nonhealthy_scorer},
         n_jobs=1,
     )
 
     per_fold = pd.DataFrame({
-        "fold":        range(1, n_splits + 1),
-        "f1_macro":    scores["test_f1_macro"].round(4),
-        "f1_weighted": scores["test_f1_weighted"].round(4),
-        "accuracy":    scores["test_accuracy"].round(4),
+        "fold":          range(1, n_splits + 1),
+        "F1": scores["test_F1"].round(4),
     })
     summary = pd.DataFrame([{
-        "fold":        "mean ± std",
-        "f1_macro":    f"{scores['test_f1_macro'].mean():.4f} ± {scores['test_f1_macro'].std():.4f}",
-        "f1_weighted": f"{scores['test_f1_weighted'].mean():.4f} ± {scores['test_f1_weighted'].std():.4f}",
-        "accuracy":    f"{scores['test_accuracy'].mean():.4f} ± {scores['test_accuracy'].std():.4f}",
+        "fold":          "mean ± std",
+        "F1": f"{scores['test_F1'].mean():.4f} ± {scores['test_F1'].std():.4f}",
     }])
 
     combined = pd.concat([per_fold, summary], ignore_index=True)
@@ -551,32 +529,40 @@ def evaluate_classification(
     y_pred: np.ndarray,
     class_names: list[str] = CLASS_NAMES,
     model_name: str = "Model",
+    pos_label: int = 1,
 ) -> dict[str, float]:
-    """Compute and print standard multi-class classification metrics.
+    """Compute and print binary classification metrics (Non-Healthy = positive).
 
     Args:
-        y_true:      Ground-truth integer labels.
+        y_true:      Ground-truth integer labels (0=Healthy, 1=Non-Healthy).
         y_pred:      Predicted integer labels.
         class_names: Human-readable class names (index → name).
         model_name:  Label used in printed output.
+        pos_label:   Index of the positive class (default 1 = Non-Healthy).
 
     Returns:
-        Dict with keys 'accuracy', 'f1_macro', 'f1_weighted'.
+        Dict with keys 'precision', 'recall', 'F1'.
     """
-    acc        = accuracy_score(y_true, y_pred)
-    f1_macro   = f1_score(y_true, y_pred, average="macro",    zero_division=0)
-    f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    from sklearn.metrics import precision_score, recall_score
 
+    precision     = precision_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+    recall        = recall_score(y_true, y_pred,    pos_label=pos_label, zero_division=0)
+    f1_nonhealthy = f1_score(y_true, y_pred,        pos_label=pos_label, zero_division=0)
+
+    pos_name = class_names[pos_label]
     print(f"\n{'=' * 50}")
     print(f"  {model_name} — Test-Set Results")
+    print(f"  (positive class: {pos_name})")
     print(f"{'=' * 50}")
-    print(f"  Accuracy    : {acc:.4f}")
-    print(f"  F1 Macro    : {f1_macro:.4f}")
-    print(f"  F1 Weighted : {f1_weighted:.4f}")
-    print()
-    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+    print(f"  Precision : {precision:.4f}   # of predicted {pos_name}, how many truly are")
+    print(f"  Recall    : {recall:.4f}   # of actual {pos_name}, how many were caught")
+    print(f"  F1        : {f1_nonhealthy:.4f}")
 
-    return {"accuracy": acc, "f1_macro": f1_macro, "f1_weighted": f1_weighted}
+    return {
+        "precision":     precision,
+        "recall":        recall,
+        "F1": f1_nonhealthy,
+    }
 
 
 def get_confusion_matrix(

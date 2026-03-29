@@ -39,12 +39,11 @@ USEFUL_SENSORS: list[str] = [
 
 OP_SETTINGS: list[str] = ["op_setting_1", "op_setting_2", "op_setting_3"]
 
-# RUL classification thresholds (piecewise-linear degradation model)
+# RUL classification thresholds
 RUL_CAP: int = 125
-RUL_HEALTHY_THR: int = 80
-RUL_CRITICAL_THR: int = 30
+RUL_HEALTHY_THR: int = 80   # RUL > 80 → Healthy; RUL ≤ 80 → Non-Healthy
 
-CLASS_NAMES: list[str] = ["Healthy", "Degrading", "Critical"]
+CLASS_NAMES: list[str] = ["Healthy", "Non-Healthy"]
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +100,15 @@ def compute_rul(
     df: pd.DataFrame,
     rul_cap: int = RUL_CAP,
     healthy_thr: int = RUL_HEALTHY_THR,
-    critical_thr: int = RUL_CRITICAL_THR,
 ) -> pd.DataFrame:
     """Add RUL (capped) and health_class columns to the training DataFrame.
 
+    Binary labelling: 0 = Healthy (RUL > healthy_thr), 1 = Non-Healthy (RUL ≤ healthy_thr).
+
     Args:
-        df:           Raw training DataFrame (must have unit_nr, time_cycles).
-        rul_cap:      Maximum RUL value (plateau assumption for early lifecycle).
-        healthy_thr:  RUL threshold separating Healthy from Degrading.
-        critical_thr: RUL threshold separating Degrading from Critical.
+        df:          Raw training DataFrame (must have unit_nr, time_cycles).
+        rul_cap:     Maximum RUL value (plateau assumption for early lifecycle).
+        healthy_thr: RUL threshold separating Healthy from Non-Healthy.
 
     Returns:
         DataFrame with added 'rul', 'capped_rul', 'health_class' columns.
@@ -118,10 +117,7 @@ def compute_rul(
     max_cycles = df.groupby("unit_nr")["time_cycles"].transform("max")
     df["rul"]        = (max_cycles - df["time_cycles"]).astype(int)
     df["capped_rul"] = df["rul"].clip(upper=rul_cap).astype(int)
-    df["health_class"] = np.where(
-        df["capped_rul"] > healthy_thr, 0,
-        np.where(df["capped_rul"] > critical_thr, 1, 2)
-    ).astype(int)
+    df["health_class"] = np.where(df["capped_rul"] > healthy_thr, 0, 1).astype(int)
     return df
 
 
@@ -131,17 +127,17 @@ def attach_test_rul(
     fd_id: int,
     rul_cap: int = RUL_CAP,
     healthy_thr: int = RUL_HEALTHY_THR,
-    critical_thr: int = RUL_CRITICAL_THR,
 ) -> pd.DataFrame:
     """Attach ground-truth RUL labels to a test DataFrame.
 
+    Binary labelling: 0 = Healthy (RUL > healthy_thr), 1 = Non-Healthy (RUL ≤ healthy_thr).
+
     Args:
-        df_test:  Test DataFrame for a single FD split (unit_nr globally encoded).
-        data_dir: Directory containing RUL_FD00X.txt files.
-        fd_id:    Sub-dataset index matching df_test.
-        rul_cap:  RUL cap for piecewise-linear model.
-        healthy_thr:  Healthy/Degrading boundary.
-        critical_thr: Degrading/Critical boundary.
+        df_test:     Test DataFrame for a single FD split (unit_nr globally encoded).
+        data_dir:    Directory containing RUL_FD00X.txt files.
+        fd_id:       Sub-dataset index matching df_test.
+        rul_cap:     RUL cap for piecewise-linear model.
+        healthy_thr: Healthy / Non-Healthy boundary.
 
     Returns:
         Test DataFrame with 'rul', 'capped_rul', 'health_class' columns.
@@ -152,15 +148,12 @@ def attach_test_rul(
 
     true_rul = pd.read_csv(rul_path, header=None, names=["true_rul"]).squeeze()
 
-    df_test   = df_test.copy()
-    raw_unit  = (df_test["unit_nr"] % 1000).astype(int)
+    df_test    = df_test.copy()
+    raw_unit   = (df_test["unit_nr"] % 1000).astype(int)
     max_cycles = df_test.groupby("unit_nr")["time_cycles"].transform("max")
     last_rul   = true_rul.values[raw_unit.values - 1]
 
     df_test["rul"]        = (last_rul + max_cycles.values - df_test["time_cycles"].values).astype(int)
     df_test["capped_rul"] = df_test["rul"].clip(upper=rul_cap).astype(int)
-    df_test["health_class"] = np.where(
-        df_test["capped_rul"] > healthy_thr, 0,
-        np.where(df_test["capped_rul"] > critical_thr, 1, 2)
-    ).astype(int)
+    df_test["health_class"] = np.where(df_test["capped_rul"] > healthy_thr, 0, 1).astype(int)
     return df_test

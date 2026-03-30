@@ -1,31 +1,40 @@
 # Predictive Maintenance — Turbofan Engine Health Classification
 
 Binary health classification on the NASA C-MAPSS turbofan engine dataset,
-demonstrating an end-to-end MLOps pipeline from raw sensor data to a containerised
+following the CRISP-DM methodology from raw sensor data to a containerised
 inference API with automated model selection and experiment tracking.
 
 ---
 
-## Problem Statement
+## CRISP-DM Phases
 
-Predict the current health state of a jet engine from its sensor history, enabling
-maintenance teams to intervene before catastrophic failure.
+### 1. Business Understanding
 
-**Health classes** (derived from Remaining Useful Life):
+**Fault type:** High-Pressure Compressor (HPC) degradation and fan degradation in
+jet turbofan engines — detectable via gradual shifts in temperature, pressure, and
+speed sensor readings over hundreds of operational cycles.
 
-| Class | RUL range | Meaning |
+**Problem framing:** Rather than regressing a precise RUL value, the task is
+reframed as binary fault detection — a more actionable output for maintenance teams:
+
+| Class | RUL range | Interpretation |
 |---|---|---|
-| Healthy (0) | > threshold | Normal operation |
-| Non-Healthy (1) | ≤ threshold | Degradation detected — maintenance warranted |
+| Healthy (0) | > 80 cycles | Normal operation, no intervention required |
+| Non-Healthy (1) | ≤ 80 cycles | Degradation detected — schedule maintenance |
 
-The threshold is selected data-driven via an ExtraTrees proxy grid-search on training
-data (default: RUL > 80 → Healthy).
+The threshold (80 cycles) is searched data-driven via an ExtraTrees proxy grid-search
+on training data, not assumed.
+
+**Success metric:** **Recall on the Non-Healthy class** is the primary objective —
+a missed fault leads to unplanned downtime, which is more costly than an unnecessary
+maintenance check. F1 is the model selection metric; precision is monitored to keep
+false alarm rates manageable.
 
 ---
 
-## Dataset
+### 2. Data Understanding
 
-**NASA C-MAPSS** (Commercial Modular Aero-Propulsion System Simulation)
+**Dataset:** NASA C-MAPSS (Commercial Modular Aero-Propulsion System Simulation)
 Source: [Kaggle — behrad3d/nasa-cmaps](https://www.kaggle.com/datasets/behrad3d/nasa-cmaps)
 
 | Sub-dataset | Operating conditions | Fault modes | Train engines | Test engines |
@@ -35,12 +44,184 @@ Source: [Kaggle — behrad3d/nasa-cmaps](https://www.kaggle.com/datasets/behrad3
 | FD003 | 1 | HPC + fan degradation | 100 | 100 |
 | FD004 | 6 | HPC + fan degradation | 249 | 248 |
 
-The dataset ships with a **predefined engine-level train/test split**:
-- `train_FD00X.txt` — complete run-to-failure trajectories; labels derived internally
-- `test_FD00X.txt` — truncated sequences of entirely unseen engines
-- `RUL_FD00X.txt` — ground-truth RUL at the last observed test cycle (used to reconstruct `y_test`)
+**Key observations from EDA:**
+- The dataset ships with a predefined **engine-level** train/test split — whole
+  engines are either in train or test, with no cycle-level overlap.
+- `train_FD00X.txt` contains complete run-to-failure trajectories; RUL is derived
+  from the final observed cycle.
+- `test_FD00X.txt` contains truncated sequences of unseen engines; `RUL_FD00X.txt`
+  provides the ground-truth RUL at the last observed cycle.
+- FD002 and FD004 operate under **6 distinct operating conditions**, creating
+  multi-modal sensor distributions that must be handled before feature extraction.
+- Class imbalance is present: early-lifecycle healthy cycles dominate, so optimising
+  accuracy would mask poor fault detection.
 
 Dataset is downloaded automatically via `kagglehub` on first run.
+
+---
+
+### 3. Data Preparation
+
+The full preprocessing chain is implemented in [utils/feature_engineering.py](utils/feature_engineering.py)
+and [utils/data_loader.py](utils/data_loader.py).
+
+**Step 1 — RUL labelling and health class assignment**
+RUL is computed as `max_cycle − current_cycle` per engine. Cycles with RUL ≤ 80
+are labelled Non-Healthy (1); all others are Healthy (0).
+
+**Step 2 — Operating-condition normalisation**
+The same engine running at different loads produces different sensor amplitudes —
+even when healthy. To remove this load-dependent bias before feature extraction:
+- KMeans clustering (k=6) on the 3 operational settings identifies the operating
+  regime of each cycle.
+- Per-cluster z-score normalisation is applied to all 14 informative sensors:
+  `z = (x − μ_condition) / σ_condition`
+- Parameters are fit on training data only and applied to the test set.
+
+**Step 3 — Rolling window feature extraction (short window, 30 cycles)**
+For each of the 14 normalised sensors, a 30-cycle sliding window computes:
+`mean, std, min, max, delta (last − first)`
+This yields 70 features capturing recent degradation trends.
+
+**Step 4 — Long-window trend features (60 cycles)**
+A 60-cycle window extracts `lw_mean, lw_std, slope` per sensor (42 features),
+capturing slower degradation trajectories that a short window would miss.
+
+**Step 5 — Min-max scaling**
+Final scaling is fit on training features only; scale parameters are saved to
+`models/scale_params.json` and reused at inference time.
+
+**Total engineered features:** 115 (3 op_settings + 14 sensors × 8 statistics + normalised cycle position)
+
+---
+
+### 4. Modelling
+
+#### Model selection strategy
+
+With labelled fault data available, supervised classification is appropriate.
+Two approaches are evaluated:
+
+**FLAML AutoML (primary)**
+- Searches over LightGBM, XGBoost, Random Forest, Extra Trees, and linear models
+- Directly optimises **F1 on the Non-Healthy class** — not accuracy
+- **Engine-level GroupKFold CV** (5 folds): whole engines are held out per fold,
+  eliminating same-engine cycle leakage and testing true generalisation to unseen assets
+- Best model and hyperparameters registered automatically in MLflow Model Registry
+- Decision threshold tuned post-training on a held-out validation fold
+
+**LSTM (optional — requires TensorFlow)**
+- Input: sequences of shape `(30 cycles × 115 features)`
+- Architecture: LSTM(128) → Dropout → LSTM(64) → Dropout → Dense(64, relu) → Dense(2, softmax)
+- Class-weighted training to handle imbalance; early stopping (patience=10) and ReduceLROnPlateau
+
+#### Temporal split discipline
+
+The test set is touched **exactly once**: after FLAML completes its search and the
+best model is selected from CV results alone. This mirrors the production scenario
+where the model must generalise to engines it has never seen.
+
+---
+
+### 5. Evaluation
+
+**Primary metrics** (accuracy is not reported as a standalone metric):
+
+| Metric | Why it matters |
+|---|---|
+| **Recall (Non-Healthy)** | Measures missed fault rate — the most dangerous error |
+| **F1 (Non-Healthy)** | Balances recall against false alarm rate |
+| Precision (Non-Healthy) | Quantifies false alarm rate for operations teams |
+| Confusion matrix | Translates statistical errors into business impact |
+
+**Threshold tuning:** After FLAML selects the best model, a sweep over
+`P(Non-Healthy) ∈ [0.10, 0.70]` identifies the threshold maximising F1 on a
+held-out validation fold. The default (0.5) and tuned thresholds are both reported.
+
+**Current results** (re-run the notebook to populate):
+
+| Model | CV F1 | Test F1 | Test Recall |
+|---|---|---|---|
+| FLAML AutoML — default threshold | — | — | — |
+| FLAML AutoML — tuned threshold | — | — | — |
+| LSTM | — | — | — |
+
+*Restart kernel → Run All to reproduce.*
+
+**Explainability (SHAP):**
+SHAP TreeExplainer identifies the most predictive features for the Non-Healthy class:
+- `sensor_14_mean` / `sensor_14_std` — core speed tracks late-stage degradation
+- `sensor_11_mean` — HPC static pressure rises with compressor fouling
+- `sensor_04_delta` — rate-of-change in LPT outlet temperature detects abrupt deterioration
+
+Note: `norm_cycle` is **excluded** from features — it encodes lifecycle position
+derived from the failure point and constitutes target leakage.
+
+![SHAP global importance](assets/shap_global_importance.png)
+
+---
+
+### 6. Deployment
+
+#### MLflow experiment tracking
+
+All training runs are logged to the local MLflow Model Registry under
+`turbofan-health-classification`. Each run records:
+- Section 0 constants (window sizes, RUL threshold, k-means clusters, etc.)
+- FLAML search configuration (time budget, metric, estimator list)
+- Best estimator name and hyperparameters
+- CV F1, test F1, test recall
+- Trained model artifact with input/output schema
+
+```bash
+python -m mlflow ui
+# Open http://127.0.0.1:5000
+```
+
+#### FastAPI inference service
+
+The trained pipeline is exposed as a REST API. Raw C-MAPSS sensor files are
+accepted directly — operating-condition normalisation, rolling feature extraction,
+and min-max scaling all run server-side.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Liveness probe + loaded model metadata |
+| POST | `/predict_file` | Upload raw C-MAPSS `.txt` → health label + probability |
+
+```bash
+curl -X POST "http://localhost:8001/predict_file?unit_id=1" \
+  -F "file=@data/raw/test_FD001.txt"
+# → {"labels": ["Healthy"], "predictions": [0], "probabilities": [[0.94, 0.06]], ...}
+```
+
+#### Docker containerisation
+
+```bash
+# Local (no Docker)
+uvicorn utils.inference_api:app --reload --port 8000
+
+# Docker (recommended)
+docker compose up --build
+# Swagger UI → http://localhost:8001/docs
+```
+
+The `mlruns/` and `models/` directories are **mounted as read-only volumes** —
+not baked into the image. Retrain on the host, then `docker compose restart` to
+deploy the new model version without rebuilding the image.
+
+#### CI/CD
+
+Pushing to `main` automatically rebuilds and publishes the Docker inference image
+via GitHub Actions (`.github/workflows/docker.yml`). The image is hosted on GitHub
+Container Registry and pulled by `docker-compose.yml` at runtime.
+
+```
+git push → GitHub Actions → docker build → ghcr.io/…/turbofan-health-api:latest
+```
+
+Training remains a **local step** — run the notebook, commit the updated `mlruns/`,
+then push. No retraining happens inside Docker.
 
 ---
 
@@ -48,8 +229,8 @@ Dataset is downloaded automatically via `kagglehub` on first run.
 
 ```
 predictive-maintenance-rul/
-├── PredictiveMaintenance_Training.ipynb   # Main notebook (full pipeline)
-├── requirements.txt                       # Full training dependencies
+├── PredictiveMaintenance_Training.ipynb   # Main notebook (full CRISP-DM pipeline)
+├── requirements.txt                       # Full training dependencies (pinned)
 ├── requirements-inference.txt             # Minimal inference-only dependencies
 ├── Dockerfile                             # Container for inference API
 ├── docker-compose.yml                     # Compose config (port 8001)
@@ -68,148 +249,6 @@ predictive-maintenance-rul/
     ├── inference_api.py                   # FastAPI inference service
     └── plot_style.py                      # Global plot theme and colour palettes
 ```
-
----
-
-## Pipeline Overview
-
-```
-Data Acquisition → EDA → Preprocessing → AutoML → Evaluation → Explainability → Deployment
-```
-
-| Section | What happens |
-|---|---|
-| 1. Data Acquisition | Download C-MAPSS via kagglehub; load train + test splits for FD001–FD004 |
-| 2. EDA | Class distribution, sensor degradation trends, correlation heatmap |
-| 3. Preprocessing | RUL labelling → data-driven threshold search → operating-condition normalisation → 30-cycle rolling features → 100-cycle long-window features (lw_mean, lw_std, slope) → min-max scaling |
-| 4. Model Definition | FLAML AutoML configuration; optional LSTM sequence model |
-| 5. AutoML & Model Selection | FLAML searches LightGBM / XGBoost / RF / linear models with engine-level GroupKFold CV, optimising F1; best run logged to MLflow |
-| 6. Evaluation | Test-set metrics (accuracy, precision, recall, F1) — test set touched exactly once |
-| 7. Visualisations | Confusion matrices (default vs tuned threshold), feature importance, LSTM training curves |
-| 8. Explainability | SHAP TreeExplainer — beeswarm + global bar chart |
-| 9. Summary | Key findings and limitations |
-
----
-
-## Models
-
-### FLAML AutoML (primary)
-- Searches over LightGBM, XGBoost, Random Forest, Extra Trees, and linear models
-- Directly optimises **F1** — fault detection as the positive class
-- **Engine-level GroupKFold CV** — whole engines are held out per fold, eliminating same-engine cycle leakage
-- Best model and hyperparameters registered automatically in MLflow Model Registry
-- Input: flat feature vector (115 features per cycle: 14 sensors × 8 statistics + 3 op_settings)
-- Decision threshold tuned on a held-out validation fold to further maximise F1
-
-### LSTM (optional — requires TensorFlow)
-- Input: sequences of engineered features `(100 cycles × 115 features)` — same feature set as AutoML
-- 2-layer LSTM (128 → 64 units) with dropout, early stopping, and class-weighted training
-- Captures temporal degradation patterns across consecutive cycles end-to-end
-
----
-
-## Key Results
-
-> Results below are from the current clean pipeline: official engine-level train/test split,
-> engine-level GroupKFold CV inside FLAML, operating-condition normalisation, and leakage-free scaling.
-> Re-run the notebook to reproduce.
-
-| Model | CV F1 | Test F1  | Test Accuracy |
-|---|---|---|---|
-| **FLAML AutoML — default thr** | — | — | — |
-| **FLAML AutoML — tuned thr** | — | — | — |
-| LSTM | — | — | — |
-
-*Re-run the notebook (Restart → Run All) to populate these numbers.*
-
----
-
-## Explainability
-
-SHAP values identify the most predictive features for the **Non-Healthy** class:
-
-- `sensor_14_mean` / `sensor_14_std` — core speed tracks late-stage degradation
-- `sensor_11_mean` — HPC static pressure rises with compressor fouling
-- `sensor_04_delta` — rate-of-change in LPT outlet temperature detects abrupt deterioration
-
-Note: `norm_cycle` is **excluded** from features — it encodes lifecycle position derived
-from the failure point and constitutes target leakage.
-
-![SHAP global importance](assets/shap_global_importance.png)
-
----
-
-## MLflow Experiment Tracking
-
-All training runs are logged to the local MLflow Model Registry under the
-experiment `turbofan-health-classification`.
-
-```bash
-# Launch the MLflow UI from the project root
-python -m mlflow ui
-# Open http://127.0.0.1:5000
-```
-
-Each run records:
-- All Section 0 constants (window size, RUL thresholds, number of op-condition clusters, etc.)
-- FLAML search configuration (time budget, metric)
-- Best estimator name and hyperparameters
-- CV F1 best, test accuracy, test F1
-- Trained model artifact with input/output schema
-
----
-
-## Inference API
-
-### Local (no Docker)
-
-```bash
-uvicorn utils.inference_api:app --reload --port 8000
-# Swagger UI → http://localhost:8000/docs
-```
-
-### Docker (recommended)
-
-```bash
-docker compose up --build
-# Swagger UI → http://localhost:8001/docs
-```
-
-### Endpoints
-
-| Method | Endpoint | Input | Description |
-|---|---|---|---|
-| GET | `/health` | — | Liveness probe + model metadata |
-| POST | `/predict_file` | C-MAPSS `.txt` file upload | Full pipeline server-side: condition normalisation → rolling features → min-max → predict |
-
-**`/predict_file` example** — upload a raw C-MAPSS test file, get health label back:
-
-```bash
-curl -X POST "http://localhost:8001/predict_file?unit_id=1" \
-  -F "file=@data/raw/test_FD001.txt"
-# → {"labels": ["Healthy"], "predictions": [0], "probabilities": [[0.94, 0.06]], ...}
-```
-
-The `mlruns/` and `models/` directories are **mounted as read-only volumes** — not
-baked into the image. Retraining on the host and running `docker compose restart`
-is all that is needed to deploy a new model version.
-
----
-
-## CI/CD
-
-Pushing to `main` automatically rebuilds and publishes the Docker inference image
-via GitHub Actions (`.github/workflows/docker.yml`).  The image is hosted on
-GitHub Container Registry (`ghcr.io`) and pulled by `docker-compose.yml` at runtime.
-
-```
-git push → GitHub Actions → docker build → ghcr.io/…/turbofan-health-api:latest
-                                         → docker compose up (pulls new image)
-```
-
-Training is intentionally kept as a **local step** — run the notebook, commit
-the updated `mlruns/`, then push. The container mounts `mlruns/` as a read-only
-volume so no retraining happens inside Docker.
 
 ---
 
@@ -240,10 +279,13 @@ jupyter lab PredictiveMaintenance_Training.ipynb
 
 ## Limitations & Next Steps
 
-- The Healthy/Non-Healthy threshold is searched data-driven (ExtraTrees proxy) but remains a proxy for true maintenance economics; a cost-sensitive objective weighting missed faults higher than false alarms would better align with real-world deployment
-- Transformer-based sequence models (e.g. Temporal Fusion Transformer) may outperform
-  LSTM with less hyperparameter tuning
-- The k-means operating-condition clustering uses k=6 (matching FD002/FD004's known
-  regimes); a data-driven k selection (elbow / silhouette) would be more principled
-- A shared MLflow tracking server would unify experiment history across multiple
-  portfolio projects
+- The Healthy/Non-Healthy threshold is searched data-driven but remains a proxy for
+  true maintenance economics; a cost-sensitive objective weighting missed faults
+  higher than false alarms would better align with operational priorities
+- Distribution shift monitoring (PSI on rolling feature windows) is not yet
+  implemented — a natural next step before production deployment
+- Transformer-based sequence models (e.g. Temporal Fusion Transformer) may capture
+  longer-range degradation dependencies than the stacked LSTM
+- The k-means operating-condition clustering uses k=6 to match FD002/FD004's known
+  regimes; data-driven k selection (elbow / silhouette) would be more principled for
+  unseen datasets
